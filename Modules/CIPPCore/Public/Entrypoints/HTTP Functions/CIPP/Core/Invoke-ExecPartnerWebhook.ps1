@@ -2,9 +2,10 @@ function Invoke-ExecPartnerWebhook {
     <#
     .FUNCTIONALITY
         Entrypoint
+    .ROLE
+        CIPP.AppSettings.ReadWrite
     #>
-    Param($Request, $TriggerMetadata)
-
+    param($Request, $TriggerMetadata)
     switch ($Request.Query.Action) {
         'ListEventTypes' {
             $Uri = 'https://api.partnercenter.microsoft.com/webhooks/v1/registration/events'
@@ -14,25 +15,51 @@ function Invoke-ExecPartnerWebhook {
             try {
                 $Uri = 'https://api.partnercenter.microsoft.com/webhooks/v1/registration'
                 $Results = New-GraphGetRequest -uri $Uri -tenantid $env:TenantID -NoAuthCheck $true -scope 'https://api.partnercenter.microsoft.com/.default'
+
+                $ConfigTable = Get-CIPPTable -TableName Config
+                $WebhookConfig = Get-CIPPAzDataTableEntity @ConfigTable -Filter "RowKey eq 'PartnerWebhookOnboarding'"
+                if ($WebhookConfig) {
+                    $Results | Add-Member -MemberType NoteProperty -Name 'enabled' -Value ([bool]$WebhookConfig.Enabled) -Force
+                    if ($WebhookConfig.StandardsExcludeAllTenants -eq $true) {
+                        $Results | Add-Member -MemberType NoteProperty -Name 'standardsExcludeAllTenants' -Value $true -Force
+                    }
+                } else {
+                    $Results | Add-Member -MemberType NoteProperty -Name 'enabled' -Value $false -Force
+                }
             } catch {}
             if (!$Results) {
                 $Results = [PSCustomObject]@{
                     webhoookUrl           = 'None'
                     lastModifiedTimestamp = 'Never'
                     webhookEvents         = @()
+                    enabled               = $false
                 }
             }
         }
         'CreateSubscription' {
-            $BaseURL = ([System.Uri]$request.headers.'x-ms-original-url').Host
+            if ($Request.Body.EventType.value) {
+                $Request.Body.EventType = $Request.Body.EventType.value
+            }
+
+            $BaseURL = ([System.Uri]$Request.Headers.'x-ms-original-url').Host
             $Webhook = @{
-                TenantFilter  = $env:TenantId
+                TenantFilter  = $env:TenantID
                 PartnerCenter = $true
                 BaseURL       = $BaseURL
-                EventType     = $Request.body.EventType
-                ExecutingUser = $Request.headers.'x-ms-client-principal'
+                EventType     = $Request.Body.EventType
+                Headers       = $Request.Headers.'x-ms-client-principal'
             }
+
             $Results = New-CIPPGraphSubscription @Webhook
+
+            $ConfigTable = Get-CIPPTable -TableName Config
+            $PartnerWebhookOnboarding = [PSCustomObject]@{
+                PartitionKey               = 'Config'
+                RowKey                     = 'PartnerWebhookOnboarding'
+                Enabled                    = [bool]$Request.Body.enabled
+                StandardsExcludeAllTenants = $Request.Body.standardsExcludeAllTenants
+            }
+            Add-CIPPAzDataTableEntity @ConfigTable -Entity $PartnerWebhookOnboarding -Force | Out-Null
         }
         'SendTest' {
             $Results = New-GraphPOSTRequest -uri 'https://api.partnercenter.microsoft.com/webhooks/v1/registration/validationEvents' -tenantid $env:TenantID -NoAuthCheck $true -scope 'https://api.partnercenter.microsoft.com/.default'
@@ -52,7 +79,7 @@ function Invoke-ExecPartnerWebhook {
         }
     }
 
-    Push-OutputBinding -Name Response -Value @{
+    return [HttpResponseContext]@{
         StatusCode = [System.Net.HttpStatusCode]::OK
         Body       = $Body
     }
